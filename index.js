@@ -4,11 +4,10 @@ const http = require('http');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
-const { pipeline } = require('stream');
 const { Buffer } = require('buffer');
-const { WebSocket, createWebSocketStream } = require('ws');
+const { WebSocket } = require('ws');
 
-// 基础环境变量
+// 环境变量配置
 const UUID = process.env.UUID || '7bd180e8-1142-4387-93f5-03e8d750a896';
 const DOMAIN = process.env.DOMAIN || 'cf.877774.xyz';
 const PORT = parseInt(process.env.SERVER_PORT || process.env.PORT || 3000, 10);
@@ -46,8 +45,12 @@ const httpServer = http.createServer((req, res) => {
   res.end('Not Found\n');
 });
 
-// WebSocket 代理层
-const wss = new WebSocket.Server({ server: httpServer });
+// WebSocket 代理层（关闭自带 perMessageDeflate 避免压缩消耗 CPU）
+const wss = new WebSocket.Server({ 
+  server: httpServer,
+  perMessageDeflate: false,
+  maxPayload: 64 * 1024 * 1024 
+});
 
 wss.on('connection', (ws, req) => {
   const pathname = (req.url || '').split('?')[0];
@@ -55,24 +58,39 @@ wss.on('connection', (ws, req) => {
     return ws.close();
   }
 
-  // 首包接收超时（防止只建连不发数据的挂起连接）
-  const handshakeTimer = setTimeout(() => ws.close(), 10000);
+  let tcpSocket = null;
+  let isClosed = false;
 
-  ws.once('message', msg => {
+  // 资源统一清理函数
+  const destroy = () => {
+    if (isClosed) return;
+    isClosed = true;
+    if (tcpSocket) {
+      tcpSocket.destroy();
+      tcpSocket = null;
+    }
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close();
+    }
+  };
+
+  const handshakeTimer = setTimeout(destroy, 10000);
+
+  // 首包处理握手
+  ws.once('message', (msg) => {
     clearTimeout(handshakeTimer);
 
-    // 校验 VLESS 首包
     if (!Buffer.isBuffer(msg) || msg.length < 18 || msg[0] !== 0) {
-      return ws.close();
+      return destroy();
     }
     if (!msg.subarray(1, 17).equals(UUID_BUF)) {
-      return ws.close();
+      return destroy();
     }
 
     try {
       let idx = 18 + msg[17];
-      if (idx + 3 > msg.length || msg[idx] !== 1) { // 仅处理 TCP (CMD=1)
-        return ws.close();
+      if (idx + 3 > msg.length || msg[idx] !== 1) { // 仅处理 TCP (CMD = 1)
+        return destroy();
       }
 
       idx += 1;
@@ -98,40 +116,73 @@ wss.on('connection', (ws, req) => {
         host = parts.join(':');
         idx += 16;
       } else {
-        return ws.close();
+        return destroy();
       }
 
       // 回复 VLESS 握手响应
-      ws.send(Buffer.from([0, 0]));
+      ws.send(Buffer.from([0, 0]), { binary: true });
 
-      // 建立目标 TCP 连接
-      const tcpSocket = net.connect({ host, port }, () => {
-        tcpSocket.setNoDelay(true); // 禁用 Nagle 降低双向延迟
+      // 直连目标服务器
+      tcpSocket = net.connect({ host, port }, () => {
+        tcpSocket.setNoDelay(true); // 禁用 Nagle
         tcpSocket.setKeepAlive(true, 30000);
 
-        // 下发首包携带的剩余 Payload
+        // 发送首包剩余 payload
         if (idx < msg.length) {
           tcpSocket.write(msg.subarray(idx));
         }
 
-        const wsStream = createWebSocketStream(ws);
+        // ================= 极速直通管道 + 严格背压 =================
 
-        // pipeline 保证任意一方断开或出错时安全释放句柄，防止内存泄露
-        pipeline(wsStream, tcpSocket, () => {});
-        pipeline(tcpSocket, wsStream, () => {});
+        // 1. TCP -> WebSocket (下行流量：通常带宽最大)
+        tcpSocket.on('data', (chunk) => {
+          if (ws.readyState !== WebSocket.OPEN) return;
+
+          ws.send(chunk, { binary: true }, () => {
+            // WS 发送完毕后，若之前被暂停则恢复接收
+            if (tcpSocket && tcpSocket.isPaused() && ws.bufferedAmount < 65536) {
+              tcpSocket.resume();
+            }
+          });
+
+          // 如果客户端消费慢，WS 缓冲区堆积超过 256KB，暂停从 TCP 读，保护内存
+          if (ws.bufferedAmount > 262144) {
+            tcpSocket.pause();
+          }
+        });
+
+        // 2. WebSocket -> TCP (上行流量)
+        ws.on('message', (chunk) => {
+          if (!tcpSocket || isClosed) return;
+
+          const canWrite = tcpSocket.write(chunk);
+          // 如果系统内核 TCP 缓冲区满了，先暂停 WS 接收
+          if (!canWrite) {
+            ws.pause();
+          }
+        });
+
+        // 内核 TCP 缓冲区排空，通知 WS 恢复接收上行流量
+        tcpSocket.on('drain', () => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.resume();
+          }
+        });
       });
 
-      tcpSocket.on('error', () => ws.close());
+      tcpSocket.on('error', destroy);
+      tcpSocket.on('close', destroy);
+      tcpSocket.on('end', destroy);
 
     } catch {
-      ws.close();
+      destroy();
     }
   });
 
-  ws.on('error', () => {});
+  ws.on('error', destroy);
+  ws.on('close', destroy);
 });
 
-// 监听指定端口
 httpServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
