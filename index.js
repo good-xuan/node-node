@@ -1,69 +1,407 @@
 #!/usr/bin/env node
-const net = require('net'), http = require('http'), fs = require('fs'), { WebSocketServer } = require('ws');
+
+'use strict';
+
+const http = require('http');
+const net = require('net');
+const fs = require('fs');
+const crypto = require('crypto');
+const { WebSocketServer, WebSocket } = require('ws');
 
 const UUID = process.env.UUID || '7bd180e8-1142-4387-93f5-03e8d750a896';
 const DOMAIN = process.env.DOMAIN || 'cf.877774.xyz';
-const PORT = +(process.env.SERVER_PORT || process.env.PORT || 3000);
+const PORT = Number(process.env.SERVER_PORT || process.env.PORT || 3000);
+
 const SUB_PATH = process.env.SUB_PATH || UUID.slice(-12);
 const WSPATH = process.env.WSPATH || UUID.slice(0, 8);
-const UUID_BUF = Buffer.from(UUID.replace(/-/g, ''), 'hex');
 
-function parseWs(m) {
-  if (!Buffer.isBuffer(m) || m.length < 18 || m[0] !== 0 || !m.subarray(1, 17).equals(UUID_BUF)) return null;
-  let i = 18 + m[17];
-  if (i + 3 > m.length || m[i++] !== 1) return null;
-  const port = m.readUInt16BE(i);
-  const atyp = m[i += 2];
-  i += 1;
+const MAX_WS_QUEUE = 4 * 1024 * 1024;
+const WS_HIGH_WATERMARK = 512 * 1024;
+const WS_LOW_WATERMARK = 128 * 1024;
+const CONNECT_TIMEOUT = 10_000;
+const IDLE_PING_INTERVAL = 30_000;
 
-  let host = '';
-  if (atyp === 1) host = `${m[i++]}.${m[i++]}.${m[i++]}.${m[i++]}`;
-  else if (atyp === 2) { const l = m[i++]; host = m.subarray(i, i += l).toString(); }
-  else if (atyp === 3) { host = Array.from({length: 8}, (_, j) => m.readUInt16BE(i + j * 2).toString(16)).join(':'); i += 16; }
-  else return null;
-
-  return { host, port, data: i < m.length ? m.subarray(i) : null };
+if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(UUID)) {
+  throw new Error('Invalid UUID');
 }
 
-const server = http.createServer((req, res) => {
-  const p = (req.url || '').split('?')[0];
-  if (p === '/') {
-    return fs.existsSync('index.html') ? fs.createReadStream('index.html').pipe(res) : res.end('OK\n');
+const UUID_BUF = Buffer.from(UUID.replace(/-/g, ''), 'hex');
+
+function parseVlessRequest(data) {
+  if (!Buffer.isBuffer(data)) {
+    data = Buffer.from(data);
   }
-  if (p === `/${SUB_PATH}`) {
-    const tls = DOMAIN !== '127.0.0.1' ? 'tls' : 'none';
-    const uri = `vless://${UUID}@${DOMAIN}:${tls === 'tls' ? 443 : PORT}?encryption=none&security=${tls}&sni=${DOMAIN}&fp=chrome&type=ws&path=%2F${WSPATH}#Node`;
-    return res.end(Buffer.from(uri).toString('base64') + '\n');
+
+  // version(1) + uuid(16) + addonLength(1)
+  if (data.length < 18) return null;
+
+  if (data[0] !== 0) return null;
+  if (!data.subarray(1, 17).equals(UUID_BUF)) return null;
+
+  const addonLength = data[17];
+  let offset = 18 + addonLength;
+
+  // command(1) + port(2) + address type(1)
+  if (offset + 4 > data.length) return null;
+
+  const command = data[offset++];
+  if (command !== 1) {
+    // 只支持 TCP
+    return null;
   }
-  res.writeHead(404).end();
-});
 
-const wss = new WebSocketServer({ server, path: `/${WSPATH}`, perMessageDeflate: false });
+  const port = data.readUInt16BE(offset);
+  offset += 2;
 
-wss.on('connection', ws => {
-  let tcp, closed = false;
-  const close = () => { if (!closed) { closed = true; tcp?.destroy(); if (ws.readyState <= 1) ws.close(); } };
-  const timer = setTimeout(close, 10000);
+  const addressType = data[offset++];
 
-  ws.once('message', msg => {
-    clearTimeout(timer);
-    const req = parseWs(msg);
-    if (!req) return close();
+  let host;
 
-    ws.send(Buffer.from([0, 0]), { binary: true });
-    tcp = net.connect({ host: req.host, port: req.port }, () => {
-      tcp.setNoDelay(true);
-      if (req.data) tcp.write(req.data);
-      tcp.on('data', b => {
-        if (ws.readyState === 1) ws.send(b, { binary: true }, () => tcp.isPaused() && ws.bufferedAmount < 65536 && tcp.resume());
-        if (ws.bufferedAmount > 262144) tcp.pause();
+  if (addressType === 1) {
+    // IPv4
+    if (offset + 4 > data.length) return null;
+
+    host = Array.from(data.subarray(offset, offset + 4)).join('.');
+    offset += 4;
+  } else if (addressType === 2) {
+    // Domain
+    if (offset + 1 > data.length) return null;
+
+    const length = data[offset++];
+
+    if (offset + length > data.length) return null;
+
+    host = data.subarray(offset, offset + length).toString('utf8');
+    offset += length;
+
+    if (!host || host.length > 253) return null;
+  } else if (addressType === 3) {
+    // IPv6
+    if (offset + 16 > data.length) return null;
+
+    const parts = [];
+
+    for (let i = 0; i < 8; i++) {
+      parts.push(data.readUInt16BE(offset + i * 2).toString(16));
+    }
+
+    host = parts.join(':');
+    offset += 16;
+  } else {
+    return null;
+  }
+
+  return {
+    host,
+    port,
+    payload: offset < data.length ? data.subarray(offset) : null
+  };
+}
+
+function safeCloseWebSocket(ws) {
+  if (ws.readyState === WebSocket.OPEN ||
+      ws.readyState === WebSocket.CONNECTING) {
+    try {
+      ws.close();
+    } catch (_) {
+      try {
+        ws.terminate();
+      } catch (_) {}
+    }
+  }
+}
+
+function createHttpServer() {
+  return http.createServer((req, res) => {
+    const pathname = (req.url || '').split('?')[0];
+
+    if (pathname === '/') {
+      if (fs.existsSync('index.html')) {
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8'
+        });
+
+        fs.createReadStream('index.html')
+          .on('error', () => {
+            if (!res.headersSent) res.writeHead(500);
+            res.end('Internal Server Error\n');
+          })
+          .pipe(res);
+
+        return;
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8'
       });
-      ws.on('message', b => !tcp.write(b) && ws.pause());
-      tcp.on('drain', () => ws.readyState === 1 && ws.resume());
-    });
-    tcp.on('error', close).on('close', close);
+      res.end('OK\n');
+      return;
+    }
+
+    if (pathname === `/${SUB_PATH}`) {
+      const tlsEnabled = DOMAIN !== '127.0.0.1' && DOMAIN !== 'localhost';
+      const security = tlsEnabled ? 'tls' : 'none';
+      const port = tlsEnabled ? 443 : PORT;
+
+      const uri =
+        `vless://${UUID}@${DOMAIN}:${port}` +
+        `?encryption=none` +
+        `&security=${security}` +
+        `&sni=${encodeURIComponent(DOMAIN)}` +
+        `&fp=chrome` +
+        `&type=ws` +
+        `&host=${encodeURIComponent(DOMAIN)}` +
+        `&path=%2F${encodeURIComponent(WSPATH)}` +
+        `#Node`;
+
+      const encoded = Buffer.from(uri).toString('base64');
+
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store'
+      });
+      res.end(`${encoded}\n`);
+      return;
+    }
+
+    res.writeHead(404);
+    res.end('Not Found\n');
   });
-  ws.on('error', close).on('close', close);
+}
+
+const server = createHttpServer();
+
+const wss = new WebSocketServer({
+  server,
+  path: `/${WSPATH}`,
+  perMessageDeflate: false,
+  maxPayload: 2 * 1024 * 1024
 });
 
-server.listen(PORT, '0.0.0.0', () => console.log(`Port ${PORT}`));
+wss.on('connection', (ws, request) => {
+  let tcp = null;
+  let closed = false;
+  let connected = false;
+  let tcpBlocked = false;
+
+  let wsQueue = [];
+  let wsQueueBytes = 0;
+
+  const connectTimer = setTimeout(() => {
+    closeConnection();
+  }, CONNECT_TIMEOUT);
+
+  const pingTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.ping();
+      } catch (_) {
+        closeConnection();
+      }
+    }
+  }, IDLE_PING_INTERVAL);
+
+  function cleanup() {
+    clearTimeout(connectTimer);
+    clearInterval(pingTimer);
+
+    wsQueue = [];
+    wsQueueBytes = 0;
+  }
+
+  function closeConnection() {
+    if (closed) return;
+
+    closed = true;
+    cleanup();
+
+    if (tcp && !tcp.destroyed) {
+      tcp.destroy();
+    }
+
+    safeCloseWebSocket(ws);
+  }
+
+  function enqueueWsData(data) {
+    const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+
+    wsQueueBytes += chunk.length;
+
+    if (wsQueueBytes > MAX_WS_QUEUE) {
+      closeConnection();
+      return;
+    }
+
+    wsQueue.push(chunk);
+    flushWsQueue();
+  }
+
+  function flushWsQueue() {
+    if (closed || !connected || !tcp || tcp.destroyed) return;
+    if (tcpBlocked) return;
+
+    while (wsQueue.length > 0) {
+      const chunk = wsQueue.shift();
+      wsQueueBytes -= chunk.length;
+
+      const writable = tcp.write(chunk);
+
+      if (!writable) {
+        tcpBlocked = true;
+        break;
+      }
+    }
+  }
+
+  function handleWsMessage(data, isBinary) {
+    if (closed || !isBinary) {
+      closeConnection();
+      return;
+    }
+
+    if (!connected) {
+      enqueueWsData(data);
+      return;
+    }
+
+    if (!tcp || tcp.destroyed) {
+      closeConnection();
+      return;
+    }
+
+    if (!tcp.write(data)) {
+      tcpBlocked = true;
+    }
+  }
+
+  function sendTcpData(data) {
+    if (closed || ws.readyState !== WebSocket.OPEN) {
+      closeConnection();
+      return;
+    }
+
+    try {
+      ws.send(data, { binary: true }, () => {
+        if (closed || !tcp || tcp.destroyed) return;
+
+        if (
+          tcpBlocked &&
+          ws.bufferedAmount <= WS_LOW_WATERMARK
+        ) {
+          tcpBlocked = false;
+          tcp.resume();
+        }
+      });
+
+      if (
+        ws.bufferedAmount >= WS_HIGH_WATERMARK &&
+        tcp &&
+        !tcp.destroyed
+      ) {
+        tcp.pause();
+      }
+    } catch (_) {
+      closeConnection();
+    }
+  }
+
+  function connectTarget(req) {
+    tcp = net.createConnection({
+      host: req.host,
+      port: req.port
+    });
+
+    tcp.setNoDelay(true);
+    tcp.setKeepAlive(true, 30_000);
+
+    tcp.once('connect', () => {
+      if (closed) return;
+
+      connected = true;
+      clearTimeout(connectTimer);
+
+      // 只有目标连接成功后才返回 VLESS 响应头
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(Buffer.from([0, 0]), { binary: true });
+        } catch (_) {
+          closeConnection();
+          return;
+        }
+      }
+
+      // 发送首包中携带的剩余数据
+      if (req.payload && req.payload.length > 0) {
+        enqueueWsData(req.payload);
+      }
+
+      // 发送连接建立前暂存的 WebSocket 数据
+      flushWsQueue();
+    });
+
+    tcp.on('data', sendTcpData);
+
+    tcp.on('drain', () => {
+      if (closed) return;
+
+      tcpBlocked = false;
+      flushWsQueue();
+
+      if (
+        ws.readyState === WebSocket.OPEN &&
+        ws.bufferedAmount <= WS_LOW_WATERMARK
+      ) {
+        tcp.resume();
+      }
+    });
+
+    tcp.on('error', () => {
+      closeConnection();
+    });
+
+    tcp.on('close', () => {
+      closeConnection();
+    });
+  }
+
+  ws.once('message', (firstMessage, isBinary) => {
+    if (closed || !isBinary) {
+      closeConnection();
+      return;
+    }
+
+    const requestInfo = parseVlessRequest(firstMessage);
+
+    if (!requestInfo) {
+      closeConnection();
+      return;
+    }
+
+    /*
+     * 立即注册后续消息监听。
+     * 目标 TCP 尚未连接时，数据会进入 wsQueue，
+     * 避免 Node.js EventEmitter 因没有 listener 而丢包。
+     */
+    ws.on('message', handleWsMessage);
+
+    connectTarget(requestInfo);
+  });
+
+  ws.on('error', () => {
+    closeConnection();
+  });
+
+  ws.on('close', () => {
+    closeConnection();
+  });
+});
+
+server.on('clientError', (err, socket) => {
+  socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`VLESS WebSocket server listening on :${PORT}`);
+  console.log(`WebSocket path: /${WSPATH}`);
+  console.log(`Subscription path: /${SUB_PATH}`);
+});
