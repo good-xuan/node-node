@@ -1,436 +1,407 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>未来科技 · 展示页面</title>
+#!/usr/bin/env node
 
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
+'use strict';
+
+const http = require('http');
+const net = require('net');
+const fs = require('fs');
+const crypto = require('crypto');
+const { WebSocketServer, WebSocket } = require('ws');
+
+const UUID = process.env.UUID || '7bd180e8-1142-4387-93f5-03e8d750a896';
+const DOMAIN = process.env.DOMAIN || 'cf.877774.xyz';
+const PORT = Number(process.env.SERVER_PORT || process.env.PORT || 3000);
+
+const SUB_PATH = process.env.SUB_PATH || UUID.slice(-12);
+const WSPATH = process.env.WSPATH || UUID.slice(0, 8);
+
+const MAX_WS_QUEUE = 4 * 1024 * 1024;
+const WS_HIGH_WATERMARK = 512 * 1024;
+const WS_LOW_WATERMARK = 128 * 1024;
+const CONNECT_TIMEOUT = 10_000;
+const IDLE_PING_INTERVAL = 30_000;
+
+if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(UUID)) {
+  throw new Error('Invalid UUID');
+}
+
+const UUID_BUF = Buffer.from(UUID.replace(/-/g, ''), 'hex');
+
+function parseVlessRequest(data) {
+  if (!Buffer.isBuffer(data)) {
+    data = Buffer.from(data);
+  }
+
+  // version(1) + uuid(16) + addonLength(1)
+  if (data.length < 18) return null;
+
+  if (data[0] !== 0) return null;
+  if (!data.subarray(1, 17).equals(UUID_BUF)) return null;
+
+  const addonLength = data[17];
+  let offset = 18 + addonLength;
+
+  // command(1) + port(2) + address type(1)
+  if (offset + 4 > data.length) return null;
+
+  const command = data[offset++];
+  if (command !== 1) {
+    // 只支持 TCP
+    return null;
+  }
+
+  const port = data.readUInt16BE(offset);
+  offset += 2;
+
+  const addressType = data[offset++];
+
+  let host;
+
+  if (addressType === 1) {
+    // IPv4
+    if (offset + 4 > data.length) return null;
+
+    host = Array.from(data.subarray(offset, offset + 4)).join('.');
+    offset += 4;
+  } else if (addressType === 2) {
+    // Domain
+    if (offset + 1 > data.length) return null;
+
+    const length = data[offset++];
+
+    if (offset + length > data.length) return null;
+
+    host = data.subarray(offset, offset + length).toString('utf8');
+    offset += length;
+
+    if (!host || host.length > 253) return null;
+  } else if (addressType === 3) {
+    // IPv6
+    if (offset + 16 > data.length) return null;
+
+    const parts = [];
+
+    for (let i = 0; i < 8; i++) {
+      parts.push(data.readUInt16BE(offset + i * 2).toString(16));
     }
 
-    :root {
-      --primary: #8b5cf6;
-      --secondary: #06b6d4;
-      --text: #f8fafc;
-      --muted: #a5b4fc;
-      --bg: #080b18;
-      --card: rgba(255, 255, 255, 0.08);
-      --border: rgba(255, 255, 255, 0.14);
-    }
+    host = parts.join(':');
+    offset += 16;
+  } else {
+    return null;
+  }
 
-    html {
-      scroll-behavior: smooth;
-    }
+  return {
+    host,
+    port,
+    payload: offset < data.length ? data.subarray(offset) : null
+  };
+}
 
-    body {
-      min-height: 100vh;
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
-        "Microsoft YaHei", sans-serif;
-      background:
-        radial-gradient(circle at 15% 20%, rgba(139, 92, 246, 0.25), transparent 30%),
-        radial-gradient(circle at 85% 80%, rgba(6, 182, 212, 0.2), transparent 30%),
-        var(--bg);
-      overflow-x: hidden;
+function safeCloseWebSocket(ws) {
+  if (ws.readyState === WebSocket.OPEN ||
+      ws.readyState === WebSocket.CONNECTING) {
+    try {
+      ws.close();
+    } catch (_) {
+      try {
+        ws.terminate();
+      } catch (_) {}
     }
+  }
+}
 
-    body::before {
-      content: "";
-      position: fixed;
-      inset: 0;
-      z-index: -1;
-      opacity: 0.18;
-      background-image:
-        linear-gradient(rgba(255,255,255,.08) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255,255,255,.08) 1px, transparent 1px);
-      background-size: 45px 45px;
-      mask-image: linear-gradient(to bottom, black, transparent);
-    }
+function createHttpServer() {
+  return http.createServer((req, res) => {
+    const pathname = (req.url || '').split('?')[0];
 
-    nav {
-      width: min(1120px, 90%);
-      margin: auto;
-      height: 80px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
+    if (pathname === '/') {
+      if (fs.existsSync('index.html')) {
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8'
+        });
 
-    .logo {
-      font-size: 24px;
-      font-weight: 800;
-      letter-spacing: 1px;
-      background: linear-gradient(90deg, #fff, #a78bfa, #22d3ee);
-      -webkit-background-clip: text;
-      color: transparent;
-    }
+        fs.createReadStream('index.html')
+          .on('error', () => {
+            if (!res.headersSent) res.writeHead(500);
+            res.end('Internal Server Error\n');
+          })
+          .pipe(res);
 
-    nav ul {
-      display: flex;
-      gap: 28px;
-      list-style: none;
-    }
-
-    nav a {
-      color: #cbd5e1;
-      text-decoration: none;
-      transition: .3s;
-    }
-
-    nav a:hover {
-      color: white;
-    }
-
-    .hero {
-      width: min(1120px, 90%);
-      min-height: 650px;
-      margin: auto;
-      display: grid;
-      grid-template-columns: 1.1fr .9fr;
-      align-items: center;
-      gap: 60px;
-    }
-
-    .tag {
-      display: inline-block;
-      margin-bottom: 22px;
-      padding: 8px 14px;
-      border: 1px solid rgba(167, 139, 250, .4);
-      border-radius: 999px;
-      color: #c4b5fd;
-      background: rgba(139, 92, 246, .12);
-      font-size: 14px;
-    }
-
-    h1 {
-      max-width: 650px;
-      font-size: clamp(42px, 7vw, 78px);
-      line-height: 1.08;
-      letter-spacing: -3px;
-    }
-
-    h1 span {
-      background: linear-gradient(90deg, #a78bfa, #22d3ee);
-      -webkit-background-clip: text;
-      color: transparent;
-    }
-
-    .hero p {
-      max-width: 560px;
-      margin: 25px 0 32px;
-      color: #94a3b8;
-      font-size: 18px;
-      line-height: 1.8;
-    }
-
-    .buttons {
-      display: flex;
-      gap: 14px;
-      flex-wrap: wrap;
-    }
-
-    .btn {
-      display: inline-block;
-      padding: 14px 24px;
-      border-radius: 10px;
-      color: white;
-      text-decoration: none;
-      font-weight: 600;
-      transition: .3s;
-    }
-
-    .btn-primary {
-      background: linear-gradient(135deg, var(--primary), var(--secondary));
-      box-shadow: 0 10px 30px rgba(99, 102, 241, .3);
-    }
-
-    .btn-secondary {
-      border: 1px solid var(--border);
-      background: var(--card);
-      backdrop-filter: blur(10px);
-    }
-
-    .btn:hover {
-      transform: translateY(-4px);
-      box-shadow: 0 15px 35px rgba(0, 0, 0, .25);
-    }
-
-    .visual {
-      position: relative;
-      height: 430px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .orb {
-      width: 280px;
-      height: 280px;
-      border-radius: 50%;
-      background:
-        radial-gradient(circle at 35% 30%, #fff, transparent 8%),
-        linear-gradient(135deg, #8b5cf6, #06b6d4);
-      box-shadow:
-        0 0 50px rgba(139, 92, 246, .5),
-        0 0 120px rgba(6, 182, 212, .25);
-      animation: float 5s ease-in-out infinite;
-    }
-
-    .orbit {
-      position: absolute;
-      width: 380px;
-      height: 150px;
-      border: 1px solid rgba(255,255,255,.25);
-      border-radius: 50%;
-      transform: rotate(-25deg);
-      animation: rotate 9s linear infinite;
-    }
-
-    .orbit::after {
-      content: "";
-      position: absolute;
-      top: 50%;
-      right: -8px;
-      width: 16px;
-      height: 16px;
-      border-radius: 50%;
-      background: #22d3ee;
-      box-shadow: 0 0 25px #22d3ee;
-    }
-
-    .glass-card {
-      position: absolute;
-      right: 0;
-      bottom: 20px;
-      padding: 22px;
-      width: 210px;
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      background: rgba(15, 23, 42, .65);
-      backdrop-filter: blur(16px);
-      box-shadow: 0 20px 50px rgba(0,0,0,.25);
-      animation: float 4s ease-in-out infinite reverse;
-    }
-
-    .glass-card small {
-      color: #94a3b8;
-    }
-
-    .glass-card strong {
-      display: block;
-      margin-top: 8px;
-      font-size: 30px;
-    }
-
-    .section {
-      width: min(1120px, 90%);
-      margin: 60px auto 100px;
-    }
-
-    .section-title {
-      margin-bottom: 28px;
-      text-align: center;
-      font-size: 36px;
-    }
-
-    .section-title span {
-      color: #a78bfa;
-    }
-
-    .cards {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 20px;
-    }
-
-    .card {
-      padding: 28px;
-      min-height: 210px;
-      border: 1px solid var(--border);
-      border-radius: 20px;
-      background: var(--card);
-      backdrop-filter: blur(12px);
-      transition: .3s;
-    }
-
-    .card:hover {
-      transform: translateY(-8px);
-      border-color: rgba(167, 139, 250, .6);
-      background: rgba(255,255,255,.12);
-    }
-
-    .icon {
-      width: 50px;
-      height: 50px;
-      display: grid;
-      place-items: center;
-      margin-bottom: 20px;
-      border-radius: 14px;
-      font-size: 24px;
-      background: linear-gradient(135deg, #8b5cf6, #06b6d4);
-    }
-
-    .card h3 {
-      margin-bottom: 12px;
-      font-size: 20px;
-    }
-
-    .card p {
-      color: #94a3b8;
-      line-height: 1.7;
-    }
-
-    footer {
-      padding: 28px;
-      border-top: 1px solid rgba(255,255,255,.1);
-      color: #64748b;
-      text-align: center;
-    }
-
-    @keyframes float {
-      0%, 100% {
-        transform: translateY(0);
-      }
-      50% {
-        transform: translateY(-18px);
-      }
-    }
-
-    @keyframes rotate {
-      from {
-        transform: rotate(-25deg) rotate(0deg);
-      }
-      to {
-        transform: rotate(-25deg) rotate(360deg);
-      }
-    }
-
-    @media (max-width: 760px) {
-      nav ul {
-        display: none;
+        return;
       }
 
-      .hero {
-        min-height: auto;
-        padding: 70px 0;
-        grid-template-columns: 1fr;
-        text-align: center;
-      }
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8'
+      });
+      res.end('OK\n');
+      return;
+    }
 
-      .hero p {
-        margin-left: auto;
-        margin-right: auto;
-      }
+    if (pathname === `/${SUB_PATH}`) {
+      const tlsEnabled = DOMAIN !== '127.0.0.1' && DOMAIN !== 'localhost';
+      const security = tlsEnabled ? 'tls' : 'none';
+      const port = tlsEnabled ? 443 : PORT;
 
-      .buttons {
-        justify-content: center;
-      }
+      const uri =
+        `vless://${UUID}@${DOMAIN}:${port}` +
+        `?encryption=none` +
+        `&security=${security}` +
+        `&sni=${encodeURIComponent(DOMAIN)}` +
+        `&fp=chrome` +
+        `&type=ws` +
+        `&host=${encodeURIComponent(DOMAIN)}` +
+        `&path=%2F${encodeURIComponent(WSPATH)}` +
+        `#Node`;
 
-      .visual {
-        height: 350px;
-      }
+      const encoded = Buffer.from(uri).toString('base64');
 
-      .orb {
-        width: 220px;
-        height: 220px;
-      }
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store'
+      });
+      res.end(`${encoded}\n`);
+      return;
+    }
 
-      .orbit {
-        width: 300px;
-      }
+    res.writeHead(404);
+    res.end('Not Found\n');
+  });
+}
 
-      .glass-card {
-        right: 5%;
-      }
+const server = createHttpServer();
 
-      .cards {
-        grid-template-columns: 1fr;
+const wss = new WebSocketServer({
+  server,
+  path: `/${WSPATH}`,
+  perMessageDeflate: false,
+  maxPayload: 2 * 1024 * 1024
+});
+
+wss.on('connection', (ws, request) => {
+  let tcp = null;
+  let closed = false;
+  let connected = false;
+  let tcpBlocked = false;
+
+  let wsQueue = [];
+  let wsQueueBytes = 0;
+
+  const connectTimer = setTimeout(() => {
+    closeConnection();
+  }, CONNECT_TIMEOUT);
+
+  const pingTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.ping();
+      } catch (_) {
+        closeConnection();
       }
     }
-  </style>
-</head>
+  }, IDLE_PING_INTERVAL);
 
-<body>
-  <nav>
-    <div class="logo">NOVA</div>
+  function cleanup() {
+    clearTimeout(connectTimer);
+    clearInterval(pingTimer);
 
-    <ul>
-      <li><a href="#home">首页</a></li>
-      <li><a href="#features">特色</a></li>
-      <li><a href="#contact">联系</a></li>
-    </ul>
-  </nav>
+    wsQueue = [];
+    wsQueueBytes = 0;
+  }
 
-  <main id="home">
-    <section class="hero">
-      <div>
-        <div class="tag">✨ 探索无限可能</div>
+  function closeConnection() {
+    if (closed) return;
 
-        <h1>
-          让创意<br />
-          <span>闪耀起来</span>
-        </h1>
+    closed = true;
+    cleanup();
 
-        <p>
-          一个简洁、现代且充满未来感的数字展示空间，
-          用设计连接灵感，用技术创造更好的体验。
-        </p>
+    if (tcp && !tcp.destroyed) {
+      tcp.destroy();
+    }
 
-        <div class="buttons">
-          <a href="#features" class="btn btn-primary">开始探索 →</a>
-          <a href="#contact" class="btn btn-secondary">了解更多</a>
-        </div>
-      </div>
+    safeCloseWebSocket(ws);
+  }
 
-      <div class="visual">
-        <div class="orbit"></div>
-        <div class="orb"></div>
+  function enqueueWsData(data) {
+    const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
 
-        <div class="glass-card">
-          <small>项目完成度</small>
-          <strong>98%</strong>
-          <small>持续创造精彩体验</small>
-        </div>
-      </div>
-    </section>
+    wsQueueBytes += chunk.length;
 
-    <section class="section" id="features">
-      <h2 class="section-title">我们的<span>特色</span></h2>
+    if (wsQueueBytes > MAX_WS_QUEUE) {
+      closeConnection();
+      return;
+    }
 
-      <div class="cards">
-        <div class="card">
-          <div class="icon">⚡</div>
-          <h3>极速体验</h3>
-          <p>
-            简洁高效的页面结构，带来流畅自然的交互体验。
-          </p>
-        </div>
+    wsQueue.push(chunk);
+    flushWsQueue();
+  }
 
-        <div class="card">
-          <div class="icon">🎨</div>
-          <h3>精致设计</h3>
-          <p>
-            通过渐变、玻璃拟态和动画效果，打造现代视觉风格。
-          </p>
-        </div>
+  function flushWsQueue() {
+    if (closed || !connected || !tcp || tcp.destroyed) return;
+    if (tcpBlocked) return;
 
-        <div class="card">
-          <div class="icon">🚀</div>
-          <h3>无限可能</h3>
-          <p>
-            可轻松扩展为个人主页、产品官网、作品集或品牌页面。
-          </p>
-        </div>
-      </div>
-    </section>
-  </main>
+    while (wsQueue.length > 0) {
+      const chunk = wsQueue.shift();
+      wsQueueBytes -= chunk.length;
 
-  <footer id="contact">
-    © 2026 NOVA · Designed with creativity
-  </footer>
-</body>
-</html>
+      const writable = tcp.write(chunk);
+
+      if (!writable) {
+        tcpBlocked = true;
+        break;
+      }
+    }
+  }
+
+  function handleWsMessage(data, isBinary) {
+    if (closed || !isBinary) {
+      closeConnection();
+      return;
+    }
+
+    if (!connected) {
+      enqueueWsData(data);
+      return;
+    }
+
+    if (!tcp || tcp.destroyed) {
+      closeConnection();
+      return;
+    }
+
+    if (!tcp.write(data)) {
+      tcpBlocked = true;
+    }
+  }
+
+  function sendTcpData(data) {
+    if (closed || ws.readyState !== WebSocket.OPEN) {
+      closeConnection();
+      return;
+    }
+
+    try {
+      ws.send(data, { binary: true }, () => {
+        if (closed || !tcp || tcp.destroyed) return;
+
+        if (
+          tcpBlocked &&
+          ws.bufferedAmount <= WS_LOW_WATERMARK
+        ) {
+          tcpBlocked = false;
+          tcp.resume();
+        }
+      });
+
+      if (
+        ws.bufferedAmount >= WS_HIGH_WATERMARK &&
+        tcp &&
+        !tcp.destroyed
+      ) {
+        tcp.pause();
+      }
+    } catch (_) {
+      closeConnection();
+    }
+  }
+
+  function connectTarget(req) {
+    tcp = net.createConnection({
+      host: req.host,
+      port: req.port
+    });
+
+    tcp.setNoDelay(true);
+    tcp.setKeepAlive(true, 30_000);
+
+    tcp.once('connect', () => {
+      if (closed) return;
+
+      connected = true;
+      clearTimeout(connectTimer);
+
+      // 只有目标连接成功后才返回 VLESS 响应头
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(Buffer.from([0, 0]), { binary: true });
+        } catch (_) {
+          closeConnection();
+          return;
+        }
+      }
+
+      // 发送首包中携带的剩余数据
+      if (req.payload && req.payload.length > 0) {
+        enqueueWsData(req.payload);
+      }
+
+      // 发送连接建立前暂存的 WebSocket 数据
+      flushWsQueue();
+    });
+
+    tcp.on('data', sendTcpData);
+
+    tcp.on('drain', () => {
+      if (closed) return;
+
+      tcpBlocked = false;
+      flushWsQueue();
+
+      if (
+        ws.readyState === WebSocket.OPEN &&
+        ws.bufferedAmount <= WS_LOW_WATERMARK
+      ) {
+        tcp.resume();
+      }
+    });
+
+    tcp.on('error', () => {
+      closeConnection();
+    });
+
+    tcp.on('close', () => {
+      closeConnection();
+    });
+  }
+
+  ws.once('message', (firstMessage, isBinary) => {
+    if (closed || !isBinary) {
+      closeConnection();
+      return;
+    }
+
+    const requestInfo = parseVlessRequest(firstMessage);
+
+    if (!requestInfo) {
+      closeConnection();
+      return;
+    }
+
+    /*
+     * 立即注册后续消息监听。
+     * 目标 TCP 尚未连接时，数据会进入 wsQueue，
+     * 避免 Node.js EventEmitter 因没有 listener 而丢包。
+     */
+    ws.on('message', handleWsMessage);
+
+    connectTarget(requestInfo);
+  });
+
+  ws.on('error', () => {
+    closeConnection();
+  });
+
+  ws.on('close', () => {
+    closeConnection();
+  });
+});
+
+server.on('clientError', (err, socket) => {
+  socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`VLESS WebSocket server listening on :${PORT}`);
+  console.log(`WebSocket path: /${WSPATH}`);
+  console.log(`Subscription path: /${SUB_PATH}`);
+});
