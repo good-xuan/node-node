@@ -402,6 +402,4 @@ server.on('clientError', (err, socket) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`VLESS WebSocket server listening on :${PORT}`);
-  console.log(`WebSocket path: /${WSPATH}`);
-  console.log(`Subscription path: /${SUB_PATH}`);
 });
