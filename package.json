@@ -4,7 +4,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "ws": "^8.21.2",
-    "axios": "^1.19.0"
+    "ws": "^8.21.2"
   }
 }
